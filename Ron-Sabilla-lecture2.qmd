@@ -1,0 +1,337 @@
+---
+title: "Intermediate/Advanced BigQuery for GA4"
+subtitle: "IBM 6500 – Lecture 2 Query Walkthrough"
+author: "Ron Sabilla"
+date: today
+date-format: long
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-copy: true
+    highlight-style: github
+    embed-resources: true
+---
+
+# Introduction
+
+This report walks through the Lecture 2 queries run in BigQuery on the public GA4 sample e-commerce dataset (`bigquery-public-data.ga4_obfuscated_sample_ecommerce`). Each section shows the query, explains what it does, and includes a screenshot of the output.
+
+# CTEs (WITH) to Structure Logic
+
+A CTE (Common Table Expression) creates a named "mini table" inside a query, which makes multi-step logic easier to read.
+
+## Total Users + New Users
+
+```sql
+WITH UserInfo AS (
+  SELECT
+    user_pseudo_id,
+    MAX(IF(event_name IN ('first_visit', 'first_open'), 1, 0)) AS is_new_user
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201101' AND '20201130'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_users,
+  SUM(is_new_user) AS new_users
+FROM UserInfo;
+```
+
+**What it does:** The CTE builds one row per user for November 2020 and flags them as new (1) if they triggered a `first_visit` or `first_open` event. The outer query counts every user and adds up the flags to get the number of new users.
+
+**Output:**
+
+![Total and new users, Nov. 2020](images/01-total-new-users.png){fig-align="center" width="100%"}
+
+**Takeaway:** 79,421 users visited in November 2020, and 71,734 of them (about 90%) were new, so most traffic came from first-time visitors.
+
+# Arrays + UNNEST
+
+GA4 stores many fields inside arrays, like `event_params` (key/value pairs) and `items` (products in commerce events). `UNNEST` lets us open those arrays up.
+
+## Pattern A: Scalar Subquery Extraction
+
+```sql
+SELECT
+  TIMESTAMP_MICROS(event_timestamp) AS event_time,
+  (
+    SELECT value.string_value
+    FROM UNNEST(event_params)
+    WHERE key = 'page_location'
+    LIMIT 1
+  ) AS page_location
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE event_name = 'page_view'
+  AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201202'
+LIMIT 50;
+```
+
+**What it does:** For each `page_view` event on Dec. 1–2, 2020, it converts the timestamp into a readable time and pulls the `page_location` (the URL) out of `event_params`. Because the UNNEST happens inside a subquery, each event stays as one row.
+
+**Output:**
+
+![Page views with page_location](images/02-pattern-a.png){fig-align="center" width="100%"}
+
+**Takeaway:** Each row is one page view with its timestamp and the Google Merchandise Store URL that was viewed. The row count stays at one per event because the UNNEST happens inside the subquery.
+
+## Pattern B: Flattening for Item-Level Analysis
+
+```sql
+SELECT
+  event_date,
+  item.item_name,
+  COUNT(*) AS item_rows
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*` e,
+  UNNEST(e.items) AS item
+WHERE e.event_name = 'purchase'
+  AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY event_date, item.item_name
+ORDER BY item_rows DESC
+LIMIT 20;
+```
+
+**What it does:** Putting `UNNEST` in the `FROM` clause turns each purchase into one row per item bought. It then counts how often each item showed up in purchases per day in December 2020 and returns the top 20. This changes the grain from one row per event to one row per item per event.
+
+**Output:**
+
+<!-- TODO: add Pattern B screenshot here -->
+
+**Takeaway:** _Add after pasting the Pattern B screenshot._
+
+# STRING_AGG and ARRAY_AGG
+
+These functions combine many values into a single row per group.
+
+## STRING_AGG: Event Names Seen per Day
+
+```sql
+SELECT
+  event_date,
+  STRING_AGG(DISTINCT event_name, ', ' ORDER BY event_name) AS events_seen
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201203'
+GROUP BY event_date
+ORDER BY event_date;
+```
+
+**What it does:** For Dec. 1–3, 2020, it lists every unique event type recorded each day as one alphabetized, comma-separated string. (The lecture notes had a typo, `RDER BY`, which is fixed here.)
+
+**Output:**
+
+![Event names seen per day](images/04-string-agg.png){fig-align="center" width="100%"}
+
+**Takeaway:** The same core set of events (add_to_cart, begin_checkout, purchase, page_view and more) shows up every day, which points to steady site activity across Dec. 1–3.
+
+## ARRAY_AGG Use Case 1: Items Added to Cart per User
+
+```sql
+SELECT
+  user_pseudo_id,
+  ARRAY_AGG(item.item_name IGNORE NULLS) AS items_added_to_cart
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`,
+  UNNEST(items) AS item
+WHERE event_name = 'add_to_cart'
+  AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY user_pseudo_id
+ORDER BY user_pseudo_id
+LIMIT 10;
+```
+
+**What it does:** It flattens every `add_to_cart` event into item rows, then groups by user and collects all the item names they added into one array. `IGNORE NULLS` keeps the query from failing if any item name is missing.
+
+**Output:**
+
+![Items added to cart per user](images/05-array-agg-uc1.png){fig-align="center" width="100%"}
+
+**Takeaway:** Each user collapses into one row with an array of every item they added. The first user added 10+ items, mostly apparel.
+
+## ARRAY_AGG Use Case 2: Session-Level Cart Summary
+
+```sql
+WITH add_to_cart AS (
+  SELECT
+    user_pseudo_id,
+    (
+      SELECT value.int_value
+      FROM UNNEST(event_params)
+      WHERE key = 'ga_session_id'
+    ) AS session_id,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,
+    i.item_id,
+    i.item_name,
+    i.quantity,
+    i.price
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`,
+    UNNEST(items) AS i
+  WHERE event_name = 'add_to_cart'
+    AND _TABLE_SUFFIX BETWEEN '20210101' AND '20211231'  -- cost control
+)
+SELECT
+  user_pseudo_id,
+  session_id,
+  COUNT(*) AS total_add_to_cart_events,
+  ARRAY_AGG(
+    STRUCT(item_id, item_name, quantity, price, event_timestamp)
+    ORDER BY quantity DESC, event_timestamp ASC
+    LIMIT 10
+  ) AS cart_items
+FROM add_to_cart
+WHERE session_id IS NOT NULL
+GROUP BY user_pseudo_id, session_id;
+```
+
+**What it does:** The CTE builds one row per item added to cart in 2021, tagged with its session ID. The outer query groups by user and session, counts the add-to-cart rows, and packs up to 10 items into an array of structs (ID, name, quantity, price, time), sorted by quantity and then time. The result is a mini "cart receipt" for each session.
+
+**Output:**
+
+![Session-level cart summary](images/06-array-agg-uc2.png){fig-align="center" width="100%"}
+
+**Takeaway:** 4,537 sessions had add-to-cart activity in 2021. Most sessions added just one item, and the nested cart_items columns show the item details packed into each session's array.
+
+# Joins
+
+Joins combine results from two tables based on a matching key. A `LEFT JOIN` keeps every row from the left table even when there's no match on the right.
+
+## Daily Users Joined with Daily Purchases
+
+```sql
+WITH daily_users AS (
+  SELECT
+    event_date,
+    COUNT(DISTINCT user_pseudo_id) AS users
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY event_date
+),
+daily_purchases AS (
+  SELECT
+    event_date,
+    COUNT(DISTINCT
+      (SELECT value.string_value
+       FROM UNNEST(event_params)
+       WHERE key = 'transaction_id')
+    ) AS purchases
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE event_name = 'purchase'
+    AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY event_date
+)
+SELECT
+  u.event_date,
+  u.users,
+  IFNULL(p.purchases, 0) AS purchases,
+  ROUND(
+    IFNULL(p.purchases, 0) / NULLIF(u.users, 0) * 100, 2
+  ) AS conversion_rate_pct
+FROM daily_users u
+LEFT JOIN daily_purchases p
+  ON u.event_date = p.event_date
+ORDER BY u.event_date;
+```
+
+**What it does:** Two CTEs calculate daily unique users and daily distinct transactions for December 2020. The `LEFT JOIN` keeps every day, `IFNULL` turns days with no purchases into 0, and the conversion rate shows what percent of daily users made a purchase. `NULLIF` prevents dividing by zero.
+
+**Output:**
+
+![Daily users and purchases with conversion rate](images/07-join.png){fig-align="center" width="100%"}
+
+**Takeaway:** Daily conversion rates ranged from about 1.4% to 3.1%. Dec. 6 was the low point (1.39%) and Dec. 11 hit 3.13%, as holiday shopping picked up.
+
+# Window Functions + QUALIFY
+
+Window functions calculate across rows without collapsing them into one row per group. `QUALIFY` filters on the result of a window function.
+
+## Top 3 Event Types per Day
+
+```sql
+WITH daily_event_counts AS (
+  SELECT
+    event_date,
+    event_name,
+    COUNT(*) AS events
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201207'
+  GROUP BY event_date, event_name
+)
+SELECT
+  event_date,
+  event_name,
+  events,
+  RANK() OVER (PARTITION BY event_date ORDER BY events DESC) AS rnk
+FROM daily_event_counts
+QUALIFY rnk <= 3
+ORDER BY event_date, rnk;
+```
+
+**What it does:** It counts each event type per day for Dec. 1–7, 2020, ranks them within each day from most to least frequent, and uses `QUALIFY` to keep only the top 3 per day.
+
+**Output:**
+
+![Top 3 event types per day](images/08-top3-qualify.png){fig-align="center" width="100%"}
+
+**Takeaway:** page_view, user_engagement and scroll were the top three events every day in the first week of December.
+
+## Rolling 7-Day Average of Daily Purchases
+
+```sql
+WITH daily_purchases AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS dt,
+    COUNT(*) AS purchases
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE event_name = 'purchase'
+    AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY dt
+)
+SELECT
+  dt,
+  purchases,
+  AVG(purchases) OVER (
+    ORDER BY dt
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS purchases_7d_avg
+FROM daily_purchases
+ORDER BY dt;
+```
+
+**What it does:** It converts `event_date` strings into real dates, counts purchase events per day, and calculates a rolling average over the current day and the 6 days before it. This smooths out daily spikes so the overall trend is easier to see.
+
+**Output:**
+
+![Rolling 7-day average of purchases](images/09-rolling-7d.png){fig-align="center" width="100%"}
+
+**Takeaway:** The 7-day average climbed from roughly 84 to 116 purchases per day over the first half of December, smoothing out dips like Dec. 6. Note this counts every purchase event (107 on Dec. 1), while the join query counts distinct transaction IDs (96), which shows why the counting method matters.
+
+# Approximate Functions
+
+Approximate functions trade a tiny bit of accuracy for much faster performance on large datasets.
+
+## Approximate Distinct Users per Event Type
+
+```sql
+SELECT
+  event_name,
+  APPROX_COUNT_DISTINCT(user_pseudo_id) AS approx_users
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY event_name
+ORDER BY approx_users DESC
+LIMIT 15;
+```
+
+**What it does:** It estimates how many unique users triggered each event type in December 2020 and returns the top 15. `APPROX_COUNT_DISTINCT` is close to an exact `COUNT(DISTINCT)` but runs faster and costs less on big tables.
+
+**Output:**
+
+![Approximate distinct users per event](images/10-approx-users.png){fig-align="center" width="100%"}
+
+**Takeaway:** page_view (104,837) and session_start (104,243) reached the most users, while only about 7,100 users added something to their cart, which shows the drop-off down the funnel.
+
+# Appendix
+
+- **Published report (GitHub Pages):** [https://rsabilla.github.io/REPO-NAME/Ron-Sabilla-lecture2.html](https://rsabilla.github.io/REPO-NAME/Ron-Sabilla-lecture2.html)
+- **GitHub repository:** [https://github.com/rsabilla/REPO-NAME](https://github.com/rsabilla/REPO-NAME)
