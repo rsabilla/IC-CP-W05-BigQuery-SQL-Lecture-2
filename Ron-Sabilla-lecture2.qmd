@@ -333,5 +333,5 @@ LIMIT 15;
 
 # Appendix
 
-- **Published report (GitHub Pages):** [https://rsabilla.github.io/REPO-NAME/Ron-Sabilla-lecture2.html](https://rsabilla.github.io/REPO-NAME/Ron-Sabilla-lecture2.html)
-- **GitHub repository:** [https://github.com/rsabilla/REPO-NAME](https://github.com/rsabilla/REPO-NAME)
+- **Published report (GitHub Pages):** [https://rsabilla.github.io/IC-CP-W05-BigQuery-SQL-Lecture-2/](https://rsabilla.github.io/IC-CP-W05-BigQuery-SQL-Lecture-2/)
+- **GitHub repository:** [https://github.com/rsabilla/IC-CP-W05-BigQuery-SQL-Lecture-2](https://github.com/rsabilla/IC-CP-W05-BigQuery-SQL-Lecture-2)
